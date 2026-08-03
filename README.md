@@ -1,7 +1,12 @@
 # wiretally
 
 Run any command behind an ephemeral counting proxy and get a per-domain byte report when it
-exits.
+exits. No root, no certificate to install, no setup.
+
+Counts traffic from **cooperative clients** — those that honour `HTTP_PROXY`/`HTTPS_PROXY`/
+`ALL_PROXY`, which covers `curl`, `git`, the AWS SDKs, `requests`, and most everything else that
+speaks HTTP or TCP. Traffic a client sends without consulting the proxy is not measured; see
+[cooperative clients only](#what-this-measures-cooperative-clients-only).
 
 ```bash
 wiretally --domain-prefix amazonaws.com -- mcap info s3://my-bucket/dataset.mcap
@@ -46,6 +51,38 @@ wiretally -j -d amazonaws.com -- mcap info s3://bucket/file.mcap \
   | jq '.endpoints[] | select(.matches_filter) | {domain, ingress_bytes}'
 ```
 
+## What this measures: cooperative clients only
+
+wiretally counts what a client **chooses** to send through it. It is not a packet capture and
+not an interception layer — it is a proxy, which means it sits in the path only for clients that
+read the proxy environment variables and route themselves through it. Proxy env vars are
+advisory configuration, not enforcement.
+
+```
+counted:     child ──TCP──> wiretally ──TCP──> service     (service's only peer is the proxy)
+invisible:   child ──UDP──────────────────────> service     (proxy never involved)
+```
+
+Two consequences worth internalising:
+
+- **Inside a tunnel, accounting is complete.** Once a connection goes through wiretally, the
+  service knows nothing but the proxy's address and replies to it, so both directions are seen
+  and counted. A service cannot escape an established tunnel and talk to the child directly — it
+  has no idea the child exists.
+- **Outside a tunnel, there is nothing to see.** Anything the child sends without asking the
+  proxy first — a raw `sendto()`, a QUIC handshake, a DNS query, a library that only honours its
+  own config keys, a host matched by `NO_PROXY` — leaves the machine directly. The service then
+  replies to the child, because the child is the only peer it ever had. Those bytes are not
+  under-counted; they are absent, and wiretally cannot detect that they happened.
+
+So the report is exact for cooperative traffic and silent about the rest. For clients whose
+transports you know (the AWS SDKs, `curl`, `git`, `requests`, most gRPC-over-TCP stacks) that
+covers everything. If you are unsure for a given command, verify from outside — `lsof -i UDP -p
+<pid>` while it runs, or a one-off `sudo tcpdump -i any 'udp and port 443'`. Structurally
+bypass-proof accounting needs OS-level capture (a TUN device, eBPF, or pcap), which costs root
+or Linux-only support; wiretally trades that for being rootless, cross-platform, and
+zero-setup.
+
 ## How it works
 
 1. A proxy binds an OS-assigned port on `127.0.0.1` and speaks three protocols on it, chosen by
@@ -75,8 +112,8 @@ of resolving them first, so endpoints stay named in the report instead of collap
 | Plain HTTP | yes | forwarded by hyper |
 | gRPC, Postgres, Redis, arbitrary TCP | yes, if the client honours `ALL_PROXY` | SOCKS5 `CONNECT` |
 | UDP a client routes through the proxy | yes | SOCKS5 `UDP ASSOCIATE` relay |
-| QUIC, HTTP/3, DNS sent straight to the destination | **no** | never reaches the proxy — see below |
-| Anything from a client that ignores proxy env vars | **no** | — |
+| QUIC, HTTP/3, DNS sent straight to the destination | **no** | never reaches the proxy |
+| Anything from a client that ignores the proxy env vars | **no** | not cooperative, so not in the path |
 
 Endpoint names come from the `CONNECT` target or request URI when available, because that is
 what the child asked for; a PTR record for an S3 address (`s3-1-w.amazonaws.com`) says much less
@@ -89,19 +126,17 @@ hide traffic completely.
 
 ## Limitations
 
-Everything here follows from being a proxy rather than a packet capture:
+All of these follow from being a proxy rather than a packet capture — see
+[cooperative clients only](#what-this-measures-cooperative-clients-only) for why:
 
-- **These are TCP byte counts, plus whatever UDP a client routes through the proxy.** wiretally
-  sees only what a client deliberately hands it. If a client asks for SOCKS5 `UDP ASSOCIATE`, the
-  relay carries its datagrams and counts them. But nothing obliges a client to ask: QUIC and
-  HTTP/3 normally open a UDP socket straight to the destination, and DNS almost always does.
-  Those bytes are not under-counted, they are absent, and wiretally cannot even detect that they
-  happened — the `Alt-Svc: h3=…` header that announces the switch arrives inside TLS this tool
-  deliberately does not decrypt. **If an application or server can shift to UDP, treat the
-  totals as a floor rather than a full account.** Closing that gap needs OS-level capture (a TUN
-  device, eBPF, or pcap), not a proxy.
-- Clients that ignore the proxy environment variables are not measured: raw sockets, anything
-  with `NO_PROXY` set for the host, and SDKs that only honour their own config keys.
+- **Only cooperative clients are measured.** Anything that ignores the proxy environment
+  variables is invisible: raw sockets, hosts matched by an inherited `NO_PROXY`, and SDKs that
+  only honour their own config keys.
+- **UDP is counted only when the client routes it through the relay.** QUIC and HTTP/3 normally
+  open a UDP socket straight to the destination, and DNS almost always does. wiretally cannot
+  even detect that this happened: the `Alt-Svc: h3=…` header announcing the switch arrives inside
+  TLS it deliberately does not decrypt. **If an application or server can shift to UDP, treat
+  the totals as a floor rather than a full account.**
 - The `CONNECT`/SOCKS handshake between child and proxy is excluded from the totals — it is
   local overhead that never reaches the remote host.
 - Per-endpoint totals aggregate by hostname, so two hostnames on the same IP stay separate rows

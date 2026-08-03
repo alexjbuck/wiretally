@@ -5,6 +5,11 @@
 //! standard `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` variables has every byte it sends and
 //! receives counted per remote endpoint.
 //!
+//! This measures *cooperative* clients only. A proxy is not an interception layer: those
+//! environment variables are advisory configuration, and a client that declines to consult them
+//! sends its bytes straight out of the machine where nothing here can observe them. Accounting
+//! is exact for traffic that does come through, and blind to the rest.
+//!
 //! Tunnelled traffic is never decrypted or even parsed: `CONNECT` and SOCKS5 both become raw
 //! TCP splices, so the totals are exact wire counts for any TCP protocol the client chooses to
 //! tunnel, and there is no certificate to install. A client that asks for SOCKS5 UDP relay gets
