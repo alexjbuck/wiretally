@@ -7,8 +7,9 @@
 //!
 //! Tunnelled traffic is never decrypted or even parsed: `CONNECT` and SOCKS5 both become raw
 //! TCP splices, so the totals are exact wire counts for any TCP protocol the client chooses to
-//! tunnel, and there is no certificate to install. UDP — and therefore QUIC and HTTP/3 — cannot
-//! be carried by a proxy at all; see [`socks::Error::is_udp_associate`].
+//! tunnel, and there is no certificate to install. A client that asks for SOCKS5 UDP relay gets
+//! one, counted the same way ([`udp::Relay`]) — but UDP sent straight to a destination, which is
+//! what QUIC and HTTP/3 normally do, never reaches the proxy and cannot be seen at all.
 //!
 //! ```no_run
 //! use wiretally::{proxy::Proxy, stats::Registry};
@@ -28,3 +29,4 @@ pub mod proxy;
 pub mod report;
 pub mod socks;
 pub mod stats;
+pub mod udp;

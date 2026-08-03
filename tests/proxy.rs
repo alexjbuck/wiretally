@@ -236,32 +236,65 @@ async fn socks5_tunnels_arbitrary_tcp_and_counts_it() {
     assert_eq!(stats.egress(), payload.len() as u64);
 }
 
+/// Binds a UDP echo server, standing in for a DNS resolver or any other datagram service.
+async fn udp_echo_origin() -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..len], from).await;
+        }
+    });
+    addr
+}
+
 #[tokio::test]
-async fn socks5_udp_associate_is_refused_not_silently_counted() {
+async fn socks5_udp_associate_relays_datagrams_and_counts_them() {
+    let destination = udp_echo_origin().await;
     let registry = Arc::new(Registry::new());
     let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
 
-    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    // Control connection: ask for a UDP association and learn where to send datagrams.
+    let mut control = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    control.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut selection = [0u8; 2];
-    client.read_exact(&mut selection).await.unwrap();
-
-    // UDP ASSOCIATE, i.e. what a QUIC/HTTP3 client would ask for.
+    control.read_exact(&mut selection).await.unwrap();
     let mut request = vec![0x05, 0x03, 0x00, 0x01];
-    request.extend_from_slice(&[127, 0, 0, 1]);
-    request.extend_from_slice(&443u16.to_be_bytes());
-    client.write_all(&request).await.unwrap();
+    request.extend_from_slice(&[0, 0, 0, 0]);
+    request.extend_from_slice(&0u16.to_be_bytes());
+    control.write_all(&request).await.unwrap();
 
-    let mut reply = vec![0u8; 10];
-    client.read_exact(&mut reply).await.unwrap();
+    let mut reply = [0u8; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x00, "association should be granted, not refused");
+    let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+    let relay: SocketAddr = format!("127.0.0.1:{relay_port}").parse().unwrap();
+    assert_ne!(relay_port, 0, "reply must advertise a real relay port");
+
+    // Datagram path: header names the true destination, payload is relayed verbatim.
+    let client = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    let payload = b"datagram payload";
+    let mut wrapped = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+    wrapped.extend_from_slice(&destination.port().to_be_bytes());
+    wrapped.extend_from_slice(payload);
+    client.send_to(&wrapped, relay).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let (len, _) = client.recv_from(&mut buf).await.unwrap();
     assert_eq!(
-        reply[1], 0x07,
-        "must answer 'command not supported' so the client falls back to TCP"
+        &buf[len - payload.len()..len],
+        payload,
+        "relayed reply must carry the payload back"
     );
-    assert!(
-        registry.snapshot(None).is_empty(),
-        "a refused association must not invent an endpoint"
-    );
+
+    let stats = registry.endpoint("127.0.0.1");
+    assert_eq!(stats.egress(), payload.len() as u64, "UDP out is counted");
+    assert_eq!(stats.ingress(), payload.len() as u64, "UDP in is counted");
+    assert_eq!(stats.connections(), 1);
+
+    // Closing the control connection ends the association.
+    drop(control);
 }
 
 #[tokio::test]

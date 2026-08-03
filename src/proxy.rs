@@ -1,15 +1,19 @@
 //! The ephemeral loopback proxy.
 //!
-//! Two paths, chosen by sniffing the first request line:
+//! Four paths, chosen by sniffing the first byte of each connection:
 //!
-//! * `CONNECT host:port` — answered with `200 Connection Established`, then the two sockets
-//!   are spliced together with [`tokio::io::copy_bidirectional`]. TLS is never terminated, so
-//!   there are no certificates to install and no per-byte crypto cost; the counters see exactly
-//!   the ciphertext that crosses the wire.
+//! * SOCKS5 `CONNECT` — any TCP protocol the client cares to tunnel.
+//! * SOCKS5 `UDP ASSOCIATE` — handed to [`crate::udp::Relay`].
+//! * HTTP `CONNECT host:port` — answered with `200 Connection Established`.
 //! * anything else (absolute-form HTTP, i.e. `GET http://host/path`) — served by hyper and
 //!   forwarded with a pooled client whose connector wraps each upstream socket in a counter.
 //!   Counting on the *upstream* socket rather than the client socket is deliberate: it measures
 //!   what actually left the machine, not what the child handed to the proxy.
+//!
+//! Both `CONNECT` forms end in the same place: the two sockets are spliced with
+//! [`tokio::io::copy_bidirectional`]. TLS is never terminated, so there are no certificates to
+//! install and no per-byte crypto cost; the counters see exactly the ciphertext that crosses
+//! the wire.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -37,6 +41,7 @@ use tower_service::Service;
 use crate::io::{ConnLog, Counting, Rewind, Side};
 use crate::socks;
 use crate::stats::{EndpointStats, OpenGuard, Registry};
+use crate::udp;
 
 /// Largest request head the proxy will buffer before giving up on a connection.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -160,31 +165,67 @@ async fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>) -> anyhow
     }
 }
 
-/// Completes a SOCKS5 handshake and splices the resulting tunnel.
+/// Completes a SOCKS5 handshake, then either splices a tunnel or starts a UDP relay.
 async fn serve_socks(mut client: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
-    let request = match socks::accept(&mut client).await {
-        Ok(request) => request,
+    let command = match socks::accept(&mut client).await {
+        Ok(command) => command,
         Err(err) => {
             let _ = socks::reply(&mut client, err.reply_code()).await;
-            if err.is_udp_associate() {
-                // Always warn: unlike other handshake failures, this one means real traffic is
-                // about to happen over UDP that no proxy can see or count.
-                eprintln!("[wiretally] warning: {err}");
-            } else if shared.verbose {
+            if shared.verbose {
                 eprintln!("[wiretally] socks5: {err}");
             }
             return Err(err.into());
         }
     };
-    connect_and_splice(
-        client,
-        request.host,
-        request.port,
-        Vec::new(),
-        shared,
-        Handshake::Socks,
-    )
-    .await
+    match command {
+        socks::Command::Connect(request) => {
+            connect_and_splice(
+                client,
+                request.host,
+                request.port,
+                Vec::new(),
+                shared,
+                Handshake::Socks,
+            )
+            .await
+        }
+        socks::Command::UdpAssociate(_) => relay_udp(client, shared).await,
+    }
+}
+
+/// Runs a UDP association for as long as its control connection stays open.
+///
+/// RFC 1928 ties the association's lifetime to this TCP connection, which conveniently gives
+/// the relay a clear shutdown signal: when the client hangs up, the relay is dropped.
+async fn relay_udp(mut client: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
+    let log = shared.conn_log("udp");
+    let relay = match udp::Relay::bind(Arc::clone(&shared.registry), log.clone()).await {
+        Ok(relay) => relay,
+        Err(err) => {
+            let _ = socks::reply(&mut client, socks::REP_GENERAL_FAILURE).await;
+            return Err(err.into());
+        }
+    };
+    let bound = relay.local_addr()?;
+    socks::reply_bound(&mut client, socks::REP_SUCCESS, bound).await?;
+    if let Some(log) = &log {
+        log.event(format!("OPEN  -> udp relay on {bound}"));
+    }
+
+    let relay = tokio::spawn(relay.run());
+    // The control connection carries no further data; reading it is purely how we learn that
+    // the client is finished with the association.
+    let mut discard = [0u8; 64];
+    while let Ok(n) = client.read(&mut discard).await {
+        if n == 0 {
+            break;
+        }
+    }
+    relay.abort();
+    if let Some(log) = &log {
+        log.event("CLOSE -> udp relay");
+    }
+    Ok(())
 }
 
 /// Which protocol's success/failure replies to send to the client.

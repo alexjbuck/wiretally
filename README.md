@@ -73,8 +73,9 @@ of resolving them first, so endpoints stay named in the report instead of collap
 |---|---|---|
 | HTTPS, HTTP/2 over TLS | yes | `CONNECT` tunnel |
 | Plain HTTP | yes | forwarded by hyper |
-| gRPC, Postgres, Redis, arbitrary TCP | yes, if the client honours `ALL_PROXY` | SOCKS5 |
-| QUIC, HTTP/3, DNS, any UDP | **no** | impossible via a proxy — see below |
+| gRPC, Postgres, Redis, arbitrary TCP | yes, if the client honours `ALL_PROXY` | SOCKS5 `CONNECT` |
+| UDP a client routes through the proxy | yes | SOCKS5 `UDP ASSOCIATE` relay |
+| QUIC, HTTP/3, DNS sent straight to the destination | **no** | never reaches the proxy — see below |
 | Anything from a client that ignores proxy env vars | **no** | — |
 
 Endpoint names come from the `CONNECT` target or request URI when available, because that is
@@ -90,12 +91,15 @@ hide traffic completely.
 
 Everything here follows from being a proxy rather than a packet capture:
 
-- **UDP is invisible, in both directions.** A proxy only sees bytes a client deliberately hands
-  it over a TCP connection, so QUIC, HTTP/3, DNS, and QUIC-based gRPC transports are not counted
-  — not under-counted, not counted at all. When a client asks for SOCKS5 `UDP ASSOCIATE`,
-  wiretally refuses with `command not supported` and prints a warning, which both makes the gap
-  visible and pushes most clients to fall back to TCP where they *can* be measured. Counting UDP
-  would require OS-level capture (a TUN device, eBPF, or pcap) rather than a proxy.
+- **These are TCP byte counts, plus whatever UDP a client routes through the proxy.** wiretally
+  sees only what a client deliberately hands it. If a client asks for SOCKS5 `UDP ASSOCIATE`, the
+  relay carries its datagrams and counts them. But nothing obliges a client to ask: QUIC and
+  HTTP/3 normally open a UDP socket straight to the destination, and DNS almost always does.
+  Those bytes are not under-counted, they are absent, and wiretally cannot even detect that they
+  happened — the `Alt-Svc: h3=…` header that announces the switch arrives inside TLS this tool
+  deliberately does not decrypt. **If an application or server can shift to UDP, treat the
+  totals as a floor rather than a full account.** Closing that gap needs OS-level capture (a TUN
+  device, eBPF, or pcap), not a proxy.
 - Clients that ignore the proxy environment variables are not measured: raw sockets, anything
   with `NO_PROXY` set for the host, and SDKs that only honour their own config keys.
 - The `CONNECT`/SOCKS handshake between child and proxy is excluded from the totals — it is
