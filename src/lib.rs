@@ -1,13 +1,17 @@
 //! Byte-accurate network accounting for an arbitrary child process.
 //!
-//! [`proxy::Proxy`] runs an ephemeral HTTP/HTTPS-`CONNECT` proxy on loopback. Any process
-//! configured to use it (via the standard `HTTP_PROXY`/`HTTPS_PROXY` environment variables)
-//! has every byte it sends and receives counted per remote endpoint, without TLS
-//! interception: `CONNECT` requests become raw TCP tunnels, so the byte totals are exact
-//! wire counts rather than decoded payload sizes.
+//! [`proxy::Proxy`] runs an ephemeral proxy on loopback that speaks three protocols on one
+//! port — HTTP, HTTP `CONNECT`, and SOCKS5 — so a child process configured through the
+//! standard `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` variables has every byte it sends and
+//! receives counted per remote endpoint.
+//!
+//! Tunnelled traffic is never decrypted or even parsed: `CONNECT` and SOCKS5 both become raw
+//! TCP splices, so the totals are exact wire counts for any TCP protocol the client chooses to
+//! tunnel, and there is no certificate to install. UDP — and therefore QUIC and HTTP/3 — cannot
+//! be carried by a proxy at all; see [`socks::Error::is_udp_associate`].
 //!
 //! ```no_run
-//! use net_counter::{proxy::Proxy, stats::Registry};
+//! use wiretally::{proxy::Proxy, stats::Registry};
 //! use std::sync::Arc;
 //!
 //! # async fn run() -> anyhow::Result<()> {
@@ -22,4 +26,5 @@ pub mod dns;
 pub mod io;
 pub mod proxy;
 pub mod report;
+pub mod socks;
 pub mod stats;

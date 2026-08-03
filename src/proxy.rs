@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tower_service::Service;
 
 use crate::io::{ConnLog, Counting, Rewind, Side};
+use crate::socks;
 use crate::stats::{EndpointStats, OpenGuard, Registry};
 
 /// Largest request head the proxy will buffer before giving up on a connection.
@@ -95,7 +96,7 @@ impl Proxy {
                     if let Err(err) = handle_connection(stream, Arc::clone(&shared)).await
                         && shared.verbose
                     {
-                        eprintln!("[net-counter] connection error: {err}");
+                        eprintln!("[wiretally] connection error: {err}");
                     }
                     drop(guard);
                 });
@@ -109,9 +110,17 @@ impl Proxy {
         self.addr
     }
 
-    /// Proxy URL in the form expected by `HTTP_PROXY` and friends.
-    pub fn url(&self) -> String {
+    /// Proxy URL in the form expected by `HTTP_PROXY` and `HTTPS_PROXY`.
+    pub fn http_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Proxy URL in the form expected by `ALL_PROXY`.
+    ///
+    /// The `socks5h` scheme (rather than `socks5`) asks the client to send hostnames to the
+    /// proxy instead of resolving them itself, which keeps endpoints named in the report.
+    pub fn socks_url(&self) -> String {
+        format!("socks5h://{}", self.addr)
     }
 }
 
@@ -121,9 +130,22 @@ impl Drop for Proxy {
     }
 }
 
-/// Sniffs the first request line and dispatches to the tunnel or HTTP path.
+/// Sniffs the first byte and dispatches to the SOCKS5, tunnel, or HTTP path.
+///
+/// One byte is enough to separate the protocols: a SOCKS5 greeting starts with its version
+/// (`0x05`), while every HTTP request starts with an ASCII method name. Peeking rather than
+/// reading keeps the HTTP paths unchanged.
 async fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
+
+    let mut first = [0u8; 1];
+    if stream.peek(&mut first).await? == 0 {
+        return Ok(());
+    }
+    if first[0] == socks::GREETING_BYTE {
+        return serve_socks(stream, shared).await;
+    }
+
     let head = read_head(&mut stream).await?;
     let Some((method, target)) = request_line(&head) else {
         anyhow::bail!("malformed request head");
@@ -131,9 +153,72 @@ async fn handle_connection(mut stream: TcpStream, shared: Arc<Shared>) -> anyhow
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let leftover = head_body(&head);
-        tunnel(stream, target, leftover, shared).await
+        let (host, port) = split_authority(target, 443);
+        connect_and_splice(stream, host, port, leftover, shared, Handshake::Http).await
     } else {
         serve_http(Rewind::new(head, stream), shared).await
+    }
+}
+
+/// Completes a SOCKS5 handshake and splices the resulting tunnel.
+async fn serve_socks(mut client: TcpStream, shared: Arc<Shared>) -> anyhow::Result<()> {
+    let request = match socks::accept(&mut client).await {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = socks::reply(&mut client, err.reply_code()).await;
+            if err.is_udp_associate() {
+                // Always warn: unlike other handshake failures, this one means real traffic is
+                // about to happen over UDP that no proxy can see or count.
+                eprintln!("[wiretally] warning: {err}");
+            } else if shared.verbose {
+                eprintln!("[wiretally] socks5: {err}");
+            }
+            return Err(err.into());
+        }
+    };
+    connect_and_splice(
+        client,
+        request.host,
+        request.port,
+        Vec::new(),
+        shared,
+        Handshake::Socks,
+    )
+    .await
+}
+
+/// Which protocol's success/failure replies to send to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handshake {
+    /// `HTTP/1.1 200 Connection Established` / `502 Bad Gateway`.
+    Http,
+    /// A SOCKS5 reply record.
+    Socks,
+}
+
+impl Handshake {
+    /// Tells the client the tunnel is open.
+    async fn accept(self, client: &mut TcpStream) -> io::Result<()> {
+        match self {
+            Self::Http => {
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+            }
+            Self::Socks => socks::reply(client, socks::REP_SUCCESS).await,
+        }
+    }
+
+    /// Tells the client the upstream connection failed.
+    async fn refuse(self, client: &mut TcpStream) -> io::Result<()> {
+        match self {
+            Self::Http => {
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await
+            }
+            Self::Socks => socks::reply(client, socks::REP_CONNECTION_REFUSED).await,
+        }
     }
 }
 
@@ -186,7 +271,7 @@ fn request_line(head: &[u8]) -> Option<(&str, &str)> {
 /// brackets of an IPv6 literal.
 ///
 /// ```
-/// use net_counter::proxy::split_authority;
+/// use wiretally::proxy::split_authority;
 ///
 /// assert_eq!(split_authority("example.com:8080", 443), ("example.com".into(), 8080));
 /// assert_eq!(split_authority("example.com", 443), ("example.com".into(), 443));
@@ -210,23 +295,26 @@ pub fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
     }
 }
 
-/// Establishes a raw TCP tunnel and counts both directions until either side closes.
-async fn tunnel(
+/// Opens the upstream connection, answers the client's handshake, and counts the tunnel.
+///
+/// Shared by the `CONNECT` and SOCKS5 paths: once either handshake names a host and port, the
+/// rest is protocol-agnostic byte shuffling, which is exactly why this tool can measure gRPC,
+/// Postgres, or any other TCP protocol the client chooses to tunnel.
+async fn connect_and_splice(
     mut client: TcpStream,
-    target: &str,
+    host: String,
+    port: u16,
     leftover: Vec<u8>,
     shared: Arc<Shared>,
+    handshake: Handshake,
 ) -> anyhow::Result<()> {
-    let (host, port) = split_authority(target, 443);
     let stats = shared.registry.endpoint(&host);
     let log = shared.conn_log(&format!("{host}:{port}"));
 
     let upstream = match TcpStream::connect((host.as_str(), port)).await {
         Ok(upstream) => upstream,
         Err(err) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = handshake.refuse(&mut client).await;
             return Err(err.into());
         }
     };
@@ -239,13 +327,11 @@ async fn tunnel(
     }
     stats.add_connection();
 
-    client
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
+    handshake.accept(&mut client).await?;
 
-    // The counter sits on the client side here so the `CONNECT` handshake itself — proxy
-    // overhead that never reaches the remote host — stays out of the totals, while any bytes
-    // the client pipelined behind it still get counted via `Rewind`.
+    // The counter sits on the client side here so the handshake itself — proxy overhead that
+    // never reaches the remote host — stays out of the totals, while any bytes the client
+    // pipelined behind it still get counted via `Rewind`.
     let mut counted = Counting::new(
         Rewind::new(leftover, client),
         Arc::clone(&stats),

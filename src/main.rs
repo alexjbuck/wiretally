@@ -1,4 +1,4 @@
-//! `net-counter` — run a command behind an ephemeral counting proxy and report its traffic.
+//! `wiretally` — run a command behind an ephemeral counting proxy and report its traffic.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use net_counter::dns::ReverseResolver;
-use net_counter::proxy::Proxy;
-use net_counter::report::Report;
-use net_counter::stats::Registry;
 use tokio::process::Command;
+use wiretally::dns::ReverseResolver;
+use wiretally::proxy::Proxy;
+use wiretally::report::Report;
+use wiretally::stats::Registry;
 
 /// How long to wait for in-flight tunnels to drain after the child exits.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -20,10 +20,10 @@ const DRAIN_POLL: Duration = Duration::from_millis(10);
 /// Measure the network traffic of a child process, grouped by remote domain.
 #[derive(Debug, Parser)]
 #[command(
-    name = "net-counter",
+    name = "wiretally",
     version,
     about = "Run a command behind a counting HTTP/HTTPS proxy and summarize its traffic",
-    after_help = "Example:\n  net-counter --domain-prefix amazonaws.com -- curl -sO https://example.com/f"
+    after_help = "Example:\n  wiretally --domain-prefix amazonaws.com -- curl -sO https://example.com/f"
 )]
 struct Cli {
     /// Domain suffix filter, e.g. "amazonaws.com"; groups matching traffic in the summary
@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("net-counter: {err:#}");
+            eprintln!("wiretally: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -58,9 +58,9 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let registry = Arc::new(Registry::new());
     let proxy = Proxy::bind(Arc::clone(&registry), cli.verbose).await?;
-    let proxy_url = proxy.url();
+    let (http_url, socks_url) = (proxy.http_url(), proxy.socks_url());
     if cli.verbose {
-        eprintln!("[net-counter] proxy listening on {proxy_url}");
+        eprintln!("[wiretally] proxy listening on {http_url} (socks5 on the same port)");
     }
 
     let (program, args) = cli
@@ -77,15 +77,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let mut child = {
         let mut command = Command::new(program);
         command.args(args);
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            command.env(key, &proxy_url);
+        // HTTP(S) clients get the `CONNECT` proxy; `ALL_PROXY` advertises SOCKS5 so clients
+        // speaking anything else over TCP tunnel through it too.
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            command.env(key, &http_url);
+        }
+        for key in ["ALL_PROXY", "all_proxy"] {
+            command.env(key, &socks_url);
         }
         command.spawn().map_err(|err| {
             anyhow::anyhow!("failed to run `{}`: {err}", program.to_string_lossy())
@@ -180,9 +178,9 @@ mod tests {
 
     #[test]
     fn cli_requires_a_command_after_double_dash() {
-        assert!(Cli::try_parse_from(["net-counter"]).is_err());
+        assert!(Cli::try_parse_from(["wiretally"]).is_err());
         let cli = Cli::try_parse_from([
-            "net-counter",
+            "wiretally",
             "-jv",
             "-d",
             "example.com",

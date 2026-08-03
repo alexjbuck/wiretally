@@ -105,12 +105,7 @@ impl Report {
         let mut out = String::with_capacity(1024);
 
         let _ = writeln!(out, "{rule}");
-        let _ = writeln!(
-            out,
-            "{:^width$}",
-            "NET-COUNTER TRAFFIC SUMMARY",
-            width = RULE
-        );
+        let _ = writeln!(out, "{:^width$}", "WIRETALLY TRAFFIC SUMMARY", width = RULE);
         let _ = writeln!(out, "{rule}");
         let _ = writeln!(out, "Command:          {}", self.command);
         let filter = match &self.domain_prefix_filter {
@@ -175,7 +170,7 @@ impl Report {
 /// Formats a byte count with binary units, two decimals above the kilobyte.
 ///
 /// ```
-/// use net_counter::report::format_bytes;
+/// use wiretally::report::format_bytes;
 ///
 /// assert_eq!(format_bytes(512), "512 B");
 /// assert_eq!(format_bytes(4311), "4.21 KB");

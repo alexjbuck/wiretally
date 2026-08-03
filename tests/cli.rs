@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_net-counter");
+const BIN: &str = env!("CARGO_BIN_EXE_wiretally");
 
 /// Starts an origin server that answers any request with a fixed-size body.
 async fn http_origin(body_len: usize) -> SocketAddr {
@@ -70,7 +70,7 @@ async fn json_report_describes_traffic_from_a_real_client() {
         .unwrap();
     assert!(
         output.status.success(),
-        "net-counter failed: {}",
+        "wiretally failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -117,7 +117,7 @@ async fn text_report_is_printed_and_exit_code_passes_through() {
         "child exit code must propagate"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("NET-COUNTER TRAFFIC SUMMARY"));
+    assert!(stdout.contains("WIRETALLY TRAFFIC SUMMARY"));
     assert!(stdout.contains("(no matching traffic observed)"));
 }
 
@@ -140,15 +140,19 @@ async fn proxy_environment_is_visible_to_the_child() {
         3,
         "all three variables should be set: {stdout}"
     );
+    let [https, http, all] = <[&str; 3]>::try_from(injected.as_slice()).unwrap();
     assert!(
-        injected
-            .iter()
-            .all(|url| url.starts_with("http://127.0.0.1:")),
-        "proxy URLs should point at loopback: {injected:?}"
+        https.starts_with("http://127.0.0.1:") && http == https,
+        "HTTP(S) clients get the CONNECT proxy: {injected:?}"
     );
     assert!(
-        injected.windows(2).all(|pair| pair[0] == pair[1]),
-        "all variables should carry the same URL: {injected:?}"
+        all.starts_with("socks5h://127.0.0.1:"),
+        "ALL_PROXY advertises SOCKS5 so non-HTTP TCP is covered too: {injected:?}"
+    );
+    assert_eq!(
+        all.rsplit(':').next(),
+        https.rsplit(':').next(),
+        "both protocols live on one port: {injected:?}"
     );
 }
 

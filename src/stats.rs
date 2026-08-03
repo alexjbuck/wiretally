@@ -211,7 +211,7 @@ impl Drop for OpenGuard {
 /// matches all" behave identically in the report.
 ///
 /// ```
-/// use net_counter::stats::matches_domain;
+/// use wiretally::stats::matches_domain;
 ///
 /// assert!(matches_domain("s3.amazonaws.com", Some("amazonaws.com")));
 /// assert!(matches_domain("amazonaws.com", Some("amazonaws.com")));

@@ -8,10 +8,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use net_counter::proxy::Proxy;
-use net_counter::stats::Registry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use wiretally::proxy::Proxy;
+use wiretally::stats::Registry;
 
 /// Byte counts observed by the origin server itself.
 #[derive(Debug, Default)]
@@ -185,6 +185,112 @@ async fn plain_http_counts_exact_upstream_bytes() {
         "ingress must equal the response bytes the origin sent"
     );
     assert_eq!(stats.connections(), 1);
+}
+
+/// Sends a SOCKS5 no-auth greeting and a CONNECT request for `host:port`, returning the reply.
+async fn socks_connect(client: &mut TcpStream, host: &str, port: u16) -> Vec<u8> {
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut selection = [0u8; 2];
+    client.read_exact(&mut selection).await.unwrap();
+    assert_eq!(selection, [0x05, 0x00], "no-auth should be selected");
+
+    let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    request.extend_from_slice(host.as_bytes());
+    request.extend_from_slice(&port.to_be_bytes());
+    client.write_all(&request).await.unwrap();
+
+    let mut reply = vec![0u8; 10];
+    client.read_exact(&mut reply).await.unwrap();
+    reply
+}
+
+#[tokio::test]
+async fn socks5_tunnels_arbitrary_tcp_and_counts_it() {
+    // The origin here speaks no HTTP at all — it is a plain byte echo, standing in for gRPC,
+    // Postgres, or any other TCP protocol a client might tunnel.
+    let (origin, origin_counts) = echo_origin().await;
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    let reply = socks_connect(&mut client, "localhost", origin.port()).await;
+    assert_eq!(reply[0..2], [0x05, 0x00], "expected a success reply");
+
+    let payload = b"\x00\x01binary-not-http\xff".repeat(500);
+    let mut echoed = vec![0u8; payload.len()];
+    client.write_all(&payload).await.unwrap();
+    client.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(echoed, payload, "socks tunnel must be byte-transparent");
+
+    // socks5h sends the hostname, so the endpoint is named rather than an address.
+    let stats = registry.endpoint("localhost");
+    assert_eq!(
+        stats.egress(),
+        origin_counts.read.load(Ordering::SeqCst),
+        "egress must equal what the origin received"
+    );
+    assert_eq!(stats.egress(), payload.len() as u64);
+    assert_eq!(stats.ingress(), payload.len() as u64);
+    assert_eq!(stats.connections(), 1);
+    // The SOCKS handshake is proxy overhead and must not appear in the totals.
+    assert_eq!(stats.egress(), payload.len() as u64);
+}
+
+#[tokio::test]
+async fn socks5_udp_associate_is_refused_not_silently_counted() {
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut selection = [0u8; 2];
+    client.read_exact(&mut selection).await.unwrap();
+
+    // UDP ASSOCIATE, i.e. what a QUIC/HTTP3 client would ask for.
+    let mut request = vec![0x05, 0x03, 0x00, 0x01];
+    request.extend_from_slice(&[127, 0, 0, 1]);
+    request.extend_from_slice(&443u16.to_be_bytes());
+    client.write_all(&request).await.unwrap();
+
+    let mut reply = vec![0u8; 10];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(
+        reply[1], 0x07,
+        "must answer 'command not supported' so the client falls back to TCP"
+    );
+    assert!(
+        registry.snapshot(None).is_empty(),
+        "a refused association must not invent an endpoint"
+    );
+}
+
+#[tokio::test]
+async fn socks5_and_http_share_one_port() {
+    let (origin, _) = echo_origin().await;
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut socks_client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    let reply = socks_connect(&mut socks_client, "127.0.0.1", origin.port()).await;
+    assert_eq!(reply[1], 0x00);
+    socks_client.write_all(b"abc").await.unwrap();
+    let mut echoed = [0u8; 3];
+    socks_client.read_exact(&mut echoed).await.unwrap();
+
+    let mut http_client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    http_client
+        .write_all(format!("CONNECT {origin} HTTP/1.1\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&read_head(&mut http_client).await).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "got {head}");
+    http_client.write_all(b"de").await.unwrap();
+    let mut echoed = [0u8; 2];
+    http_client.read_exact(&mut echoed).await.unwrap();
+
+    let stats = registry.endpoint("127.0.0.1");
+    assert_eq!(stats.connections(), 2, "both protocols hit the same host");
+    assert_eq!(stats.egress(), 5);
 }
 
 #[tokio::test]
