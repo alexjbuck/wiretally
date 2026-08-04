@@ -362,6 +362,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
     use tokio::io::duplex;
 
@@ -506,5 +508,192 @@ mod tests {
         let mut buf = [0u8; 10];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_address_type_is_rejected_with_its_own_code() {
+        // Greeting is fine; the request then names an address family this proxy cannot forward.
+        let bytes = vec![0x05, 0x01, 0x00, 0x05, CMD_CONNECT, 0x00, 0x09];
+        let (result, sent) = handshake(&bytes).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::UnsupportedAddressType(0x09)));
+        assert_eq!(err.reply_code(), REP_ADDRESS_NOT_SUPPORTED);
+        assert_eq!(
+            sent,
+            vec![0x05, METHOD_NONE],
+            "the greeting is answered before the request is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_is_rechecked_on_the_request_after_the_greeting() {
+        // A client can speak 0x05 in its greeting and then send a mismatched request header;
+        // accepting that would mean parsing the rest of the record under the wrong layout.
+        let bytes = vec![0x05, 0x01, 0x00, 0x04, CMD_CONNECT, 0x00, ATYP_IPV4];
+        let (result, _) = handshake(&bytes).await;
+        assert!(matches!(result, Err(Error::UnsupportedVersion(0x04))));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_handshake_surfaces_as_an_io_error() {
+        // Half a greeting, then EOF: `read_exact` fails and the error must carry its source
+        // through, since that is what the caller logs. The client half has to be dropped for the
+        // read to see EOF rather than block waiting for the second byte, so this cannot use the
+        // shared `handshake` helper.
+        let (mut client, mut server) = duplex(1024);
+        client.write_all(&[0x05]).await.unwrap();
+        drop(client);
+
+        let err = accept(&mut server).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        assert!(std::error::Error::source(&err).is_some());
+        assert_eq!(
+            err.reply_code(),
+            REP_GENERAL_FAILURE,
+            "errors with no specific code fall back to a general failure"
+        );
+    }
+
+    #[test]
+    fn every_error_describes_itself() {
+        // The proxy only ever shows these to a human in verbose mode, so the requirement is that
+        // each variant says something distinct rather than any exact wording.
+        let errors = [
+            Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Error::UnsupportedVersion(0x04),
+            Error::NoAcceptableMethod,
+            Error::UnsupportedCommand(0x02),
+            Error::UnsupportedAddressType(0x09),
+        ];
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().all(|text| !text.is_empty()));
+        assert_eq!(
+            rendered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            rendered.len(),
+            "variants must not render identically: {rendered:?}"
+        );
+        assert_eq!(
+            Error::NoAcceptableMethod.reply_code(),
+            REP_GENERAL_FAILURE,
+            "no code of its own"
+        );
+        assert!(
+            std::error::Error::source(&Error::NoAcceptableMethod).is_none(),
+            "only the io variant wraps another error"
+        );
+
+        let datagram_errors = [
+            DatagramError::Truncated,
+            DatagramError::UnsupportedAddressType(0x09),
+            DatagramError::Fragmented(0x01),
+        ];
+        let rendered: Vec<String> = datagram_errors.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            rendered.len(),
+            "variants must not render identically: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn io_errors_convert_into_handshake_errors() {
+        let err: Error = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn ipv6_datagrams_round_trip() {
+        // The v6 arms of both the encoder and the parser are otherwise only reachable on a v6
+        // host, which is exactly the configuration least likely to be tested by hand.
+        let from: SocketAddr = "[2001:db8::1]:9000".parse().unwrap();
+        let mut encoded = Vec::new();
+        encode_datagram(from, b"v6 payload", &mut encoded);
+        assert_eq!(encoded[3], ATYP_IPV6);
+
+        let parsed = parse_datagram(&encoded).unwrap();
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 9000);
+        assert_eq!(parsed.payload, b"v6 payload");
+    }
+
+    #[tokio::test]
+    async fn udp_reply_can_advertise_an_ipv6_relay() {
+        let (mut client, mut server) = duplex(64);
+        let bound: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+        reply_bound(&mut server, REP_SUCCESS, bound).await.unwrap();
+        let mut buf = [0u8; 22];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[3], ATYP_IPV6);
+        assert_eq!(
+            &buf[4..20],
+            &Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets()
+        );
+        assert_eq!(u16::from_be_bytes([buf[20], buf[21]]), 40_000);
+    }
+
+    proptest::proptest! {
+        /// Anything the encoder produces must be readable by the parser, unchanged.
+        ///
+        /// These two sit on opposite ends of the relay — the encoder writes replies to the
+        /// client, the parser reads what the client sends — so a disagreement between them
+        /// would show up as silently misrouted datagrams rather than an error.
+        #[test]
+        fn encoded_datagrams_parse_back_identically(
+            octets in proptest::array::uniform16(proptest::num::u8::ANY),
+            v4 in proptest::bool::ANY,
+            port in proptest::num::u16::ANY,
+            payload in proptest::collection::vec(proptest::num::u8::ANY, 0..512),
+        ) {
+            let ip = if v4 {
+                IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
+            } else {
+                IpAddr::V6(Ipv6Addr::from(octets))
+            };
+            let from = SocketAddr::new(ip, port);
+
+            let mut encoded = Vec::new();
+            encode_datagram(from, &payload, &mut encoded);
+            let parsed = parse_datagram(&encoded).unwrap();
+
+            proptest::prop_assert_eq!(parsed.host, ip.to_string());
+            proptest::prop_assert_eq!(parsed.port, port);
+            proptest::prop_assert_eq!(parsed.payload, payload.as_slice());
+        }
+
+        /// The parser reads attacker-shaped input off the wire, so it must never panic.
+        ///
+        /// Every length in the header comes from the datagram itself; the property that matters
+        /// is that no combination of them indexes out of bounds or overflows.
+        #[test]
+        fn parsing_arbitrary_bytes_never_panics(
+            raw in proptest::collection::vec(proptest::num::u8::ANY, 0..600),
+        ) {
+            if let Ok(datagram) = parse_datagram(&raw) {
+                proptest::prop_assert!(
+                    datagram.payload.len() <= raw.len(),
+                    "the payload is a slice of the input, so it cannot grow"
+                );
+            }
+        }
+
+        /// A datagram cut short at any point is rejected, never parsed as something smaller.
+        #[test]
+        fn truncating_a_valid_datagram_is_always_an_error(
+            cut in 0usize..13,
+        ) {
+            let from: SocketAddr = "198.51.100.4:53".parse().unwrap();
+            let mut encoded = Vec::new();
+            encode_datagram(from, b"", &mut encoded);
+            // A v4 datagram with an empty payload is exactly 10 bytes, so every prefix shorter
+            // than that is truncated; longer cuts leave it intact.
+            let prefix = &encoded[..cut.min(encoded.len())];
+            proptest::prop_assert_eq!(parse_datagram(prefix).is_err(), cut < encoded.len());
+        }
     }
 }

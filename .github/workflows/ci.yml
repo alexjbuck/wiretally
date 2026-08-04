@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the in-flight run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    # Both platforms matter here: the proxy leans on loopback socket behaviour, and `main.rs`
+    # reads Unix signals. Linux and macOS differ on connection teardown (RST vs clean FIN),
+    # which the oversized-head test depends on.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The CLI tests drive the binary with a real proxy-aware client and fail loudly if it is
+      # missing, so make sure it is here rather than letting them opt out.
+      - run: curl --version
+      - run: cargo test --all-features
+
+  msrv:
+    # Pinned in Cargo.toml as rust-version. Measured with `cargo msrv find`; the binding
+    # constraint is hickory-resolver 0.26, not edition 2024.
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  deny:
+    name: licenses + sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # Advisories are handled by the audit job instead, so this stays deterministic: it only
+      # fails when someone actually changes the dependency graph.
+      - run: cargo deny check licenses bans sources
+
+  audit:
+    name: security advisories (advisory)
+    runs-on: ubuntu-latest
+    # Advisory only. A CVE published against a transitive dependency is real information, but it
+    # arrives on the advisory database's schedule rather than ours, and it should not block a PR
+    # that has nothing to do with it. Read the annotation, don't be gated by it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  coverage:
+    name: coverage (no gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: curl --version
+      - name: Measure coverage
+        run: cargo llvm-cov --all-targets --all-features --lcov --output-path lcov.info
+      - name: Report coverage
+        # Reuses the profile data from the run above rather than re-running the suite.
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info

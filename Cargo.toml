@@ -2,6 +2,15 @@
 name = "wiretally"
 version = "0.1.0"
 edition = "2024"
+# Edition 2024 alone only needs 1.85; 1.88 is what hickory-resolver 0.26 requires. Measured with
+# `cargo msrv find --min 1.85 -- cargo check --all-targets` and enforced by the CI msrv job.
+rust-version = "1.88"
+description = "Counts a child process's network bytes per domain via an ephemeral loopback proxy"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alexjbuck/wiretally"
+readme = "README.md"
+keywords = ["proxy", "network", "bandwidth", "socks5", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -16,3 +25,24 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
 tower-service = { version = "0.3.3", default-features = false }
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+[profile.dev]
+debug = 0
+
+# The profile that 'dist' will build release artifacts with. These are the portable half of
+# cargo-wizard's fast-runtime template: every setting here produces the same binary on any
+# builder, so a release stays reproducible.
+#
+# Deliberately NOT taken from that template:
+#   * `-Ctarget-cpu=native` (a rustflag, not a profile setting) — it targets the *builder's* CPU,
+#     so a GitHub runner would emit instructions a user's machine may not have.
+#   * `panic = "abort"` — a behaviour change, not an optimisation. The proxy spawns a task per
+#     connection and is built to survive one of them failing; under abort a single panicking
+#     connection would take down the whole process.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,38 @@
+# Supply-chain policy for `cargo deny`.
+#
+# CI runs `cargo deny check licenses bans sources` as a blocking job. Security advisories are
+# deliberately NOT checked here — `cargo audit` covers those in an advisory-only job, so a newly
+# published CVE cannot turn every unrelated PR red overnight. Licence and source violations, by
+# contrast, only appear when someone changes the dependency graph, so blocking on them is safe.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licences only. Anything copyleft entering the tree should be a deliberate decision,
+# so it fails here rather than shipping quietly in a binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+# Duplicate versions are noise in a dependency tree this size, not a defect worth blocking on.
+multiple-versions = "warn"
+# A wildcard version is a real problem: it makes builds unreproducible.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
