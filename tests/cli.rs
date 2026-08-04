@@ -35,6 +35,9 @@ async fn http_origin(body_len: usize) -> SocketAddr {
     addr
 }
 
+/// Set this to run the suite on a machine without `curl`, accepting the loss of coverage.
+const OPT_OUT: &str = "WIRETALLY_ALLOW_MISSING_CURL";
+
 /// Whether `curl` is on PATH; these tests use it as a stand-in for any proxy-aware client.
 async fn have_curl() -> bool {
     Command::new("curl")
@@ -46,10 +49,31 @@ async fn have_curl() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Whether to skip a test that needs `curl`, failing instead unless skipping was asked for.
+///
+/// A missing client used to make these tests return early and report success, which is the worst
+/// of both worlds: no end-to-end coverage, and a green suite that hides it. Now the default is a
+/// failure that names the cause, and skipping is a deliberate opt-in.
+///
+/// # Panics
+///
+/// Panics if `curl` is absent and [`OPT_OUT`] is not set.
+async fn skip_without_curl() -> bool {
+    if have_curl().await {
+        return false;
+    }
+    assert!(
+        std::env::var_os(OPT_OUT).is_some(),
+        "curl is not on PATH, so this end-to-end test cannot run. Install curl, or set {OPT_OUT}=1 \
+         to skip these tests and give up their coverage."
+    );
+    eprintln!("WARNING: skipping end-to-end test: curl is not on PATH and {OPT_OUT} is set");
+    true
+}
+
 #[tokio::test]
 async fn json_report_describes_traffic_from_a_real_client() {
-    if !have_curl().await {
-        eprintln!("skipping: curl not available");
+    if skip_without_curl().await {
         return;
     }
     let origin = http_origin(4096).await;

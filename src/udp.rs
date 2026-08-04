@@ -323,4 +323,40 @@ mod tests {
         assert_eq!(socks::parse_datagram(&buf[..len]).unwrap().payload, b"ok");
         assert_eq!(registry.endpoint("127.0.0.1").egress(), 2);
     }
+
+    #[tokio::test]
+    async fn an_unresolvable_destination_is_skipped_without_killing_the_relay() {
+        // A well-formed datagram naming a host that cannot be resolved. Nothing can be sent, and
+        // UDP gives no way to tell the client, so the only correct behaviour is to drop it and
+        // keep serving — the next datagram may well be fine.
+        let destination = udp_echo().await;
+        let registry = Arc::new(Registry::new());
+        let relay = Relay::bind(Arc::clone(&registry), None).await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        tokio::spawn(relay.run());
+
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        // An empty domain name: resolution fails locally and immediately, with no DNS traffic,
+        // which keeps this test offline and deterministic.
+        let unresolvable = [0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x35, b'q'];
+        client.send_to(&unresolvable, relay_addr).await.unwrap();
+        client
+            .send_to(&wrap(destination, b"ok"), relay_addr)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            socks::parse_datagram(&buf[..len]).unwrap().payload,
+            b"ok",
+            "the relay survives to deliver the next datagram"
+        );
+        assert_eq!(
+            registry.snapshot(None).len(),
+            1,
+            "an unresolvable host never becomes a row, since no bytes ever left"
+        );
+        assert_eq!(registry.endpoint("127.0.0.1").egress(), 2);
+    }
 }

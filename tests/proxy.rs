@@ -347,6 +347,129 @@ async fn unreachable_connect_target_returns_bad_gateway() {
 }
 
 #[tokio::test]
+async fn origin_form_requests_are_rebuilt_from_the_host_header() {
+    // A well-behaved client sends `GET http://host/path` to a proxy. Some don't, and send the
+    // origin form they would send to the server itself; the proxy reconstructs the absolute URI
+    // from the Host header rather than failing the request.
+    let body = "rebuilt";
+    let (origin, origin_counts) = http_origin(body).await;
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(format!("GET /data HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&read_head(&mut client).await).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "got {head}");
+
+    let stats = registry.endpoint("127.0.0.1");
+    assert_eq!(
+        stats.egress(),
+        origin_counts.read.load(Ordering::SeqCst),
+        "a rebuilt request is counted like any other"
+    );
+    assert_eq!(stats.connections(), 1);
+}
+
+#[tokio::test]
+async fn an_origin_form_request_with_no_host_is_a_bad_request() {
+    // HTTP/1.0 permits omitting Host, which leaves the proxy with no way to know where the
+    // request was meant to go. It must say so rather than guess or hang.
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(b"GET /data HTTP/1.0\r\n\r\n")
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&read_head(&mut client).await).into_owned();
+    // The status line echoes the request's version, so this answer is HTTP/1.0.
+    assert!(head.starts_with("HTTP/1.0 400"), "got {head}");
+    assert!(
+        head.contains("text/plain"),
+        "the error body should be readable: {head}"
+    );
+    assert!(
+        registry.snapshot(None).is_empty(),
+        "nothing left the machine, so nothing is counted"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_origin_becomes_a_bad_gateway() {
+    // The forwarded-HTTP counterpart of the CONNECT 502 test: here the failure happens inside
+    // the counting connector rather than before the handshake.
+    let dead = {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client
+        .write_all(format!("GET http://{dead}/data HTTP/1.1\r\nHost: {dead}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&read_head(&mut client).await).into_owned();
+    assert!(head.starts_with("HTTP/1.1 502"), "got {head}");
+    assert_eq!(registry.endpoint("127.0.0.1").connections(), 0);
+}
+
+#[tokio::test]
+async fn an_oversized_request_head_is_refused_rather_than_buffered() {
+    // `read_head` buffers until it sees the end of the head, so an endless header stream is the
+    // one way a client could make the proxy allocate without bound. It must be cut off.
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+    // 96 KiB of header line with no terminating blank line, past the 64 KiB limit.
+    let filler = format!("X-Pad: {}\r\n", "p".repeat(1000));
+    let mut written = 0;
+    while written < 96 * 1024 {
+        if client.write_all(filler.as_bytes()).await.is_err() {
+            break; // The proxy hung up mid-write, which is the behaviour under test.
+        }
+        written += filler.len();
+    }
+
+    // Dropping the socket with unread data still queued makes the OS send an RST, so the read
+    // may fail outright instead of returning a clean EOF. Either way the client got no answer,
+    // which is the point.
+    let mut response = Vec::new();
+    match client.read_to_end(&mut response).await {
+        Ok(_) => assert!(
+            response.is_empty(),
+            "the connection should be dropped, not answered: {:?}",
+            String::from_utf8_lossy(&response)
+        ),
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset, "{err}"),
+    }
+    assert!(registry.snapshot(None).is_empty(), "nothing was forwarded");
+}
+
+#[tokio::test]
+async fn a_malformed_request_line_closes_the_connection() {
+    let registry = Arc::new(Registry::new());
+    let proxy = Proxy::bind(Arc::clone(&registry), false).await.unwrap();
+
+    let mut client = TcpStream::connect(proxy.local_addr()).await.unwrap();
+    client.write_all(b"nonsense\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.is_empty(),
+        "an unparseable head has no target to answer for: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+#[tokio::test]
 async fn multiple_connections_to_one_host_aggregate() {
     let (origin, _) = echo_origin().await;
     let registry = Arc::new(Registry::new());
