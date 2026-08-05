@@ -2,8 +2,6 @@
 name = "wiretally"
 version = "0.1.0"
 edition = "2024"
-# Edition 2024 alone only needs 1.85; 1.88 is what hickory-resolver 0.26 requires. Measured with
-# `cargo msrv find --min 1.85 -- cargo check --all-targets` and enforced by the CI msrv job.
 rust-version = "1.88"
 description = "Counts a child process's network bytes per domain via an ephemeral loopback proxy"
 license = "MIT OR Apache-2.0"
@@ -19,7 +17,12 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.5", features = ["derive"] }
 hickory-resolver = "0.26.1"
 http-body-util = "0.1.4"
-hyper = { version = "1.11.0", features = ["server", "client", "http1", "http2"] }
+hyper = { version = "1.11.0", features = [
+  "server",
+  "client",
+  "http1",
+  "http2",
+] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
