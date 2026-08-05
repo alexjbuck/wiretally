@@ -1,0 +1,66 @@
+# Publishes wiretally to crates.io, called by dist's release.yml as a publish job.
+#
+# This is a reusable workflow rather than a tag-triggered one on purpose: dist invokes it after
+# every binary has been built and hosted, so a failed build stops the publish. A standalone
+# workflow could push to crates.io while the GitHub release ends up with no artifacts attached.
+#
+# Authentication is OIDC, not a stored token. There is no CARGO_REGISTRY_TOKEN secret in this
+# repository and there should never be one. See docs/RELEASING.md.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    # dist passes the release plan as a JSON string. Declaring it is mandatory even though this
+    # job reads the version from the manifest instead.
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-crates:
+    runs-on: ubuntu-latest
+    # The trusted publisher on crates.io is scoped to this environment name, so it has to match
+    # exactly. It also carries the required-reviewer gate: by the time this job waits for
+    # approval, dist has already built and hosted every binary, so the decision is made with a
+    # green build in hand. A published version can never be replaced, only yanked.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Re-running a release, or re-pushing a tag, would otherwise fail here on an "already
+      # uploaded" error and leave a red job on a release that is actually fine. crates.io is
+      # append-only, so a version that exists cannot be published again by any means; skipping is
+      # the only outcome that differs from failing, and it is the honest one.
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          name="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].name')"
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+          echo "Resolved ${name} ${version} from Cargo.toml"
+
+          # Sparse-index layout for a crate name of four or more characters.
+          index="https://index.crates.io/${name:0:2}/${name:2:2}/${name}"
+          # A failed request falls through to "not published" and lets crates.io be the authority:
+          # a genuine duplicate is rejected server-side, so the worst case is a clear error.
+          if curl -sSf -H "User-Agent: ${name}-release-ci" "$index" \
+               | jq -e --arg v "$version" 'select(.vers == $v)' >/dev/null; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${name} ${version} is already on crates.io; skipping publish."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Exchanges GitHub's OIDC token for a crates.io token valid for 30 minutes. The action's
+      # post step revokes it when the job ends.
+      - name: Authenticate with crates.io
+        id: auth
+        if: steps.check.outputs.already == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        if: steps.check.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

@@ -41,14 +41,10 @@ Re-pushing a tag, or re-running a completed release workflow, will attempt `carg
 version that already exists and fail with an "already uploaded" error. The binaries and GitHub
 release are unaffected — only the publish job goes red.
 
-`cargo publish` has no `--skip-if-published` flag. If this becomes annoying, guard the publish
-step by checking the sparse index first:
-
-```bash
-# Exits 0 if this exact version is already on crates.io.
-curl -sS "https://index.crates.io/wi/re/wiretally" \
-  | jq -e --arg v "$VERSION" 'select(.vers == $v)' >/dev/null
-```
+`cargo publish` has no `--skip-if-published` flag, so `publish-crates.yml` guards the step by
+querying the sparse index for the version in `Cargo.toml` first, and skipping with a notice if it
+is already there. A failed index request falls through to attempting the publish, letting crates.io
+be the authority — a genuine duplicate is rejected server-side.
 
 ## Releasing today (manual)
 
@@ -107,10 +103,49 @@ Status:
 - [x] `rust-version = "1.88"` — appears in the published index metadata
 - [x] v0.1.0 published manually. crates.io requires a manual first publish; there is no
       "pending publisher" flow like PyPI's, though it is on their roadmap.
-- [ ] Trusted Publishing configured at crates.io → wiretally → Settings
-- [ ] `.github/workflows/publish-crates.yml` + `publish-jobs = ["./publish-crates"]` in
+- [x] Trusted Publishing configured at crates.io → wiretally → Settings
+- [x] GitHub environment `crates-io` created, with required reviewers
+- [x] `.github/workflows/publish-crates.yml` + `publish-jobs = ["./publish-crates"]` in
       `dist-workspace.toml`
-- [ ] Bootstrap API token revoked
+- [ ] Proven end to end by a real tag — **not yet exercised**
+- [ ] Bootstrap API token revoked (wait until an automated publish has succeeded)
+
+### The `crates-io` environment
+
+The trusted publisher config is scoped to a GitHub environment named `crates-io`. That one string
+has to match in three places, exactly:
+
+| Where | Value |
+| --- | --- |
+| crates.io trusted publisher config | `crates-io` |
+| GitHub → Settings → Environments | `crates-io` |
+| `environment:` on the publish job | `crates-io` |
+
+Named after the registry it authorizes rather than after the release, so a second publish target
+later (Homebrew, a container registry) gets its own boundary instead of overloading this one.
+
+Set **required reviewers** on it. dist builds every binary first and then parks the publish job
+awaiting approval, so you see a green build and can inspect the release before anything becomes
+permanent on crates.io.
+
+#### Deployment branches and tags
+
+Restrict it to **one tag rule, pattern `v*`, and no branch rules.**
+
+This puts "publishing only ever happens from a release tag" in a second place besides the
+`on.push.tags` trigger in `release.yml`, so both would have to be wrong for a branch to publish.
+The mistake it actually guards against is a future `workflow_dispatch` or push trigger added for
+convenience, which would silently make the publish job reachable from a branch — the workflow
+trigger cannot catch that, because it is the thing that changed.
+
+**Do not choose "protected branches only."** It is the option that sounds safest and it blocks
+every release: releases come from a tag, not a branch, and the failure reports as a generic
+permissions error rather than as an excluded tag.
+
+**This makes the `v` prefix mandatory.** dist's trigger pattern
+(`**[0-9]+.[0-9]+.[0-9]+*`) accepts both `v0.1.1` and a bare `0.1.1`, but a `v*` deployment rule
+only matches the former. Always tag `vMAJOR.MINOR.PATCH`. A bare `0.2.0` tag will build binaries
+and then block the publish for a reason that is not obvious from the error.
 
 ### Trusted Publishing
 

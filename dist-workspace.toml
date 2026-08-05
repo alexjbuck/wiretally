@@ -22,3 +22,13 @@ targets = [
 ]
 # Where to host releases
 hosting = "github"
+
+# crates.io publishing runs inside dist's pipeline, after every binary is built and hosted, so a
+# failed build stops the publish. See .github/workflows/publish-crates.yml and docs/RELEASING.md.
+publish-jobs = ["./publish-crates"]
+
+# Custom publish jobs default to { id-token = "write", packages = "write" }, and overriding
+# *replaces* that default rather than merging, so id-token has to be repeated here. `contents` is
+# needed for actions/checkout; `packages` is dropped because nothing here touches a container
+# registry.
+github-custom-job-permissions = { "publish-crates" = { id-token = "write", contents = "read" } }
