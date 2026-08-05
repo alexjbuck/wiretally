@@ -9,12 +9,12 @@ speaks HTTP or TCP. Traffic a client sends without consulting the proxy is not m
 [cooperative clients only](#what-this-measures-cooperative-clients-only).
 
 ```bash
-wiretally --domain-prefix amazonaws.com -- mcap info s3://my-bucket/dataset.mcap
+wiretally --domain-prefix example.com -- curl -s -o /dev/null https://example.com/
 ```
 
 ```text
 ================================================================================
-                          NET-COUNTER TRAFFIC SUMMARY
+                           WIRETALLY TRAFFIC SUMMARY
 ================================================================================
 Command:          curl -s -o /dev/null https://example.com/
 Target Filter:    *.example.com (Prefix Match)
@@ -31,6 +31,19 @@ TOTAL (Matching Filter):                 4.71 KB            585 B       1
 TOTAL (All Destinations):                4.71 KB            585 B       1
 ================================================================================
 ```
+
+## Install
+
+```bash
+cargo install wiretally
+```
+
+Or download a prebuilt binary for macOS or Linux (arm64 and x86_64) from the
+[latest release](https://github.com/alexjbuck/wiretally/releases/latest). Each archive holds a
+single `wiretally` binary — drop it on your `PATH`; there is nothing to configure. The Linux builds
+link against glibc.
+
+Building from source needs Rust 1.88 or newer.
 
 ## Usage
 
@@ -150,5 +163,11 @@ cargo clippy --all-targets
 ```
 
 The integration tests put a raw TCP origin server behind the proxy and make that server count
-what crossed its own socket; the proxy's counters must match those numbers exactly. No network
-access is required for them.
+what crossed its own socket; the proxy's counters must match those numbers exactly. That is the
+accuracy claim, checked directly rather than by comparing the proxy against itself. No network
+access is required for them, and the SOCKS5 datagram codec is additionally covered by property
+tests asserting that it round-trips and never panics on arbitrary input.
+
+CI runs fmt, clippy, and the full suite on Linux and macOS, plus the minimum supported Rust
+version and a dependency licence audit. Release and publishing are documented in
+[docs/RELEASING.md](docs/RELEASING.md).

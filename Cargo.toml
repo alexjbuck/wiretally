@@ -1,6 +1,6 @@
 [package]
 name = "wiretally"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Counts a child process's network bytes per domain via an ephemeral loopback proxy"
